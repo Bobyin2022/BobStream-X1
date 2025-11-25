@@ -1,0 +1,1017 @@
+unit BobStream;
+
+{$mode objfpc}{$H+}
+{$modeswitch advancedrecords}
+{$modeswitch typehelpers}
+
+{ 极速流缓存处理类组
+  设计理念：
+    缓存基础思路，原则上不使用Move操作，直接使用指针
+    1. 缓存分为三个部分，上游资源(BaseStream)，拥有者(Ownner)，下游观察/随机处理者(Viewer), 下游规范处理者(RuleOper)
+    2. 上游资源(BaseStream)，是整个缓存数据的出入口，由使用者创建，存储于拥有者
+    3. 拥有者(Owner)，是缓存资源的整体管理者，缓存区可以为自行创建或者外部创建
+      3.1 管理上游资源(BaseStream)，实现缓存数据的整体Load和Save
+      3.2 封装自有实例和外部实例的统一接口，管理自有缓存区实例的创建和销毁
+      3.3 管理缓存工作模式，Rec或者Buf，两者区别在于Rec与上游的交互必须整存整取
+      3.4 封装事件钩子
+    4. 下游观察/随机处理者(Viewer)，暴露缓存随机字节操作接口，实现急速操作
+      4.1 核心属性指针Ptr和大小Cap不能被使用者修改，
+      4.2 这个接口可以直接操作数据内容，所有边界控制，均有调用方负责参考本类的其他属性控制
+    5.下游规范处理者(RuleOper)，作为观察者的友元函数，基于缓存数据的多样处理接口，应包含边界检查
+      5.1 包含游标规范移动方法
+      5.2 应包含读写模式，以决定标准参数处理
+      5.3 实现三个基础规范操作函数，支持位流、字节流、块流（不支持跨块）
+      5.4 包含Clear、flush等规范操作辅助函数
+    缓存流设计思路
+    1. 缓存流预置包含8个缓存块，预定7位内置数据区，派生类决定其他缓存模式
+    2. 缓存流应实现数据块数据读入，写出操作，对接规范处理流，升级规范处理者的跨块处理能力，应通过回调钩子实现
+
+  编译前提：
+    1.打开 typehelpers 开关，并确保SysUtils单元为本单元最后一个引用文件，用以释放Bit[]函数
+
+  类说明：
+    TBobBufRef：下游观察/随机处理者(Viewer)
+    TBobIOBase：下游规范处理者(RuleOper)；
+    TBobBaseBuf：拥有者(Ownner)；
+    TBobBaseStream：缓存流
+
+ BobStream X1 – The Ultimate Pascal Zero-Copy Dataflow Engine
+ Version V 1.0
+    V0.8: Add TBobBufBus 增加缓存总线
+    V0.9: Add TBobError  增加出错处理
+    V1.0: 出错处理链接
+}
+
+interface
+
+uses
+  Classes,  Math, SysUtils;
+
+const
+  C_BufBitsBig =18;  //大缓存,256K
+  C_BufBitsMid =16;  //中缓存,64k
+
+  C_BobStreamConst:record
+    isWrite:Byte;
+    Event:record
+      BeRead, AfRead, BeSave, AfSave: Byte;  //事件触发标识
+    end;
+    BufStatus:record
+      isUsed,isRec,isAll:Byte;
+    end;
+  end=(isWrite    :  0; // bit0：1=写模式，0=读模式
+       Event:(
+         BeRead :  0; // 读取前
+         AfRead :  1; // 读取后
+         BeSave :  2; // 写入前
+         AfSave :  3; // 写入后
+       );
+       BufStatus:(
+         isUsed: 0; // bit0：1=启用，0=禁用
+         isRec : 1; // bit2：1=Rec模式，0=Buf模式，Rec:每次固定操作一组字节
+         isAll : 2; // bit3: 1=整存整取模式，必须一次读取整个Cap
+       );
+      );
+
+type
+  { TRCRC_Adler32 }
+  TRCRC_Adler32 = record
+  private
+    var
+      a,b:UInt32;
+  public
+    function  CRC32:UInt32; inline;//获取CRC32的值
+    procedure Init; inline;
+    procedure U8(X:UInt8); inline; //算一个字节
+    procedure Update(const Data: PByte; DataLen: UInt64);inline; //增加计算一块数据
+  end;
+
+  { 错误信息处理类 }
+  TBobError = class
+  private
+    const
+      C_MaxErrNum=32;
+    type
+      TRErr= record
+        ClassName: ShortString; // 发出的错误信息的类名字
+        MSG: ShortString;       // 错误
+      end;
+    var
+      Errs: array [0..C_MaxErrNum-1] of TRErr;
+      ErrCount: Byte;
+    function GetErr(Idx:Byte): TRErr;
+  public
+    property Item[Idx:Byte]: TRErr read GetErr; default;
+    property Count: Byte read ErrCount;
+
+    constructor Create;
+
+    procedure Clear;            // 清所有错误
+    procedure Add(AClassName: ShortString; const Msg: ShortString);
+  end;
+
+  { 缓存属性引用类 }
+  TBobBufRef=class  //本类是状态引用，不实际拥有内存资源
+  protected
+    var
+      FBufPtr : PByte;  //内存数据区指针
+      FCap    : UInt32; //缓存数据区大小
+      FStat   : Byte;   //状态
+  public
+    var
+      RecL   : UInt16; //记录模式的字节数
+      Pos    : Int64;  //当前读写操作指针偏移，可能有负值
+      Len    : UInt32; //缓存数据区内，有效数据长度
+    property Ptr  : PByte  read FBufPtr; //内存数据区指针
+    property Cap  : UInt32 read FCap; //缓存数据区大小
+    constructor Create;
+
+    procedure Assign(ABuf:PByte; ASize:UInt32); //挂载缓存
+  end;
+
+  { 缓存事件 }
+  TBobBufEV = function(const BufRef:TBobBufRef):Boolean of object;
+
+  { 接口移动类 }
+  TBobIOSeek=class
+  private
+      FData  : TBobBufRef; // 缓存引用
+  protected
+    const
+      C_BitLSB: array[0..7] of Byte = ($01, $02, $04, $08, $10, $20, $40, $80);
+      C_BitMSB: array[0..7] of Byte = ($80, $40, $20, $10, $08, $04, $02, $01);
+    var
+      FisLSB : Boolean;
+      FBitIdx: Byte; //下一个可用位序号
+      FErr   : TBobError;
+      FOwnErr: Boolean;
+      FBitMask: PByte;
+      LoadOrSave: TBobBufEV; //缓存满的事件
+    procedure SetBitMask(aBitM:Boolean);
+  public
+    property Err: TBobError read FErr;
+    property Ref: TBobBufRef read FData;
+    property isLSB: Boolean read FisLSB write SetBitMask;
+
+    constructor Create(ABuf:TBobBufRef);
+    destructor Destroy; override;
+    // 移动方法
+    function Skip(Aoff:Int32):Boolean; inline; //安全跳转
+    procedure Top; inline;  //缓存头
+    procedure Bott; inline; //有效数据
+    procedure RegLoadOrSaveEV(EV:TBobBufEV);
+    procedure SetErr(AErr:TBobError); //设置本类ERR
+  end;
+
+  { 接口读类 }
+  TBobIOLoad=class(TBobIOSeek)
+  public
+    constructor Create(ABuf:TBobBufRef);
+    function EnsureBytes(Ahead: Integer): Boolean; inline; //预定本块内可操作字节，允许负值，不跨块
+    // 快速操作函数，函数体内不做边界检查
+    procedure FastPopBit(out B:Byte); inline; //位流
+    procedure FastPopByte(out B:Byte); inline; //字节流
+    procedure FastPopVarRec(out Abuf:PByte); inline;  //块流, 返回指针引用，Pos增长RecL
+    // 安全操作函数，确保不越界
+    function PopBit(out B:Byte):Boolean; inline; //位流
+    function PopByte(out B:Byte):Boolean; inline;  //字节流
+    function PopBuf(Abuf:PByte; ALen:UInt32):Boolean; inline;  //块流, Move后返回
+  end;
+
+  { 接口写类 }
+  TBobIOSave=class(TBobIOSeek)
+  public
+    constructor Create(ABuf:TBobBufRef);
+
+    procedure ClearData; // 清空数据（写模式需要）
+    procedure Flush(isReset: Boolean=True);  //清空缓存(缺省重置指针)
+    function EnsureBytes(Ahead: Integer): Boolean; inline;//预定本块内可操作字节，允许负值，不跨块
+    // 快速操作函数，函数体内不做边界检查
+    procedure FastPushBit(B:Byte); inline; //位流
+    procedure FastPushByte(B:Byte); inline; //字节流
+
+    // 安全操作函数，确保不越界
+    function PushBit(B:Byte):Boolean; inline; //位流
+    function PushByte(B:Byte):Boolean; inline;  //字节流
+    function PushBuf(Abuf:PByte; ALen:UInt32):Boolean; inline;  //块流, Move后返回
+  end;
+
+  { 缓存基类 }
+  TBobBaseBuf=class
+  private
+    var
+     FEvents: array [0..7] of TBobBufEV;
+     FEVMask:Byte;         //有效事件掩码
+     FBuf  : TMemoryStream;//数据区
+     FOwnErr: Boolean;
+     FLoader: TBobIOLoad;  //下游IO读操作
+     FSaver : TBobIOSave;  //下游IO写操作
+  protected
+    FSS   : TStream;     //上游流
+    FData : TBobBufRef;  //资源引用
+    FErr  : TBobError; //出错信息
+
+    function DoEvent(When:Byte):Boolean;
+  public
+    property BaseStream : TStream read FSS write FSS;
+    property Ref    : TBobBufRef read FData;
+    property Loader : TBobIOLoad read FLoader;
+    property Saver  : TBobIOSave read FSaver;
+    property Err    : TBobError read FErr;
+
+    constructor Create;  // 初始化空缓存
+    constructor Create(const ASize:UInt32);  // 初始化指定大小的自有缓存
+    constructor Create(const Buf:PByte; const Cap:UInt32; const RecLen:UInt16=1); // 初始化外挂缓存
+    destructor Destroy; override;
+
+    procedure SetSize(BufSize:UInt32);
+    procedure SetErr(AErr:TBobError); //设置本类ERR
+    procedure AssignRec(const Buf:PByte; const Cap:UInt32; const RecLen:UInt16=1); //挂载外部记录
+    procedure AssignBuf(const BufRef:TBobBufRef); //挂载外部缓存
+    procedure RegEvent(AWhen:Byte; AEV:TBobBufEV);
+    procedure ClearEvent; inline;
+
+    function FromStream(const BufRef: TBobBufRef=nil):Boolean; //从SS中读取ALen数据到FData, 缺省读取Cap大小
+    function ToStream(const BufRef: TBobBufRef=nil):Boolean;  // 向SS中写入FData的Len数据
+    function Flush: Boolean;
+    function CountCRC:UInt32;
+  end;
+
+  { 缓存总线类 }
+  // 预置8块缓存，按需分配设置上游流的类
+  TBobBufBus=class
+  protected
+    type
+      TBusMask = Byte;      //缓存掩码类型
+    const
+      C_BufNum = SizeOf(TBusMask)*8 ; //缓存掩码类型Bit长度，为缓存个数
+      C_SlotNum = C_BufNum shr 1;     //流插槽个数，为缓存个数一半
+    type
+      TSlot = class      //流插槽
+        BaseStream: TStream; //上游流
+        Mask: TBusMask; //挂载的Bufs掩码
+      end;
+      TBufArr = array [0..C_BufNum-1] of TBobBaseBuf; //8个缓存数组
+      TSlotArr= array [0..C_SlotNum-1] of TSlot;      //流插槽数组
+    var
+      FBufArr : TBufArr;
+      FErr    : TBobError;
+      FOwnErr : Boolean;
+      FBufMask: Byte;
+    procedure EnableBufs(ABufMask:Byte); //启，停用缓存
+  public
+    const
+      CMD_Load =0; //读取
+      CMD_Save =1; //写入
+      CMD_Flush=2; //清空写缓存
+    var
+      Slots       : TSlotArr; //上游流插槽
+
+  	property Err : TBobError read FErr;
+    property Bufs: TBufArr read FBufArr;
+    property BufMask: Byte read FBufMask write EnableBufs;
+
+  	constructor Create;
+  	destructor Destroy; override;
+
+    procedure SetErr(AErr:TBobError); //设置本类ERR
+    procedure Slots2Bufs; //根据Fslots,刷新bufs数组，并更新缓存启停状态
+    function  Exec(ABufs:Byte; AComd:Byte=0):Boolean; //操作
+    procedure ReNewEvents; virtual; //清空并重置标准事件
+  end;
+
+  { 工作器库 }
+  TBobBufsWorkerLib=class(TBobBufBus)   //工作器库
+  private
+    const
+      IDX_B0=0;
+      IDX_B1=1;
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    procedure BlockCopyer(F1,F2:TStream);   //复制器
+    procedure Checker(F1,F2:TStream);  //检查器
+  end;
+
+implementation
+{==============================================================================}
+{ TRCRC_Adler32 }
+{==============================================================================}
+procedure TRCRC_Adler32.Init;
+begin
+  a:=1; b:=0;
+end;
+
+procedure TRCRC_Adler32.U8(X:UInt8);
+begin
+  a := (a + X) mod 65521;
+  b := (b + a) mod 65521;
+end;
+
+function TRCRC_Adler32.CRC32:UInt32;
+begin
+  Result:=(b shl 16) or a;
+end;
+
+procedure TRCRC_Adler32.Update(const Data: PByte; DataLen: UInt64);
+var
+  i,t: UInt64;
+begin
+  t:=0;
+  for i:=0 to DataLen-1 do
+  begin
+    a:=a+Data[i];
+    b:=b+a;
+    Inc(t);
+    if t=5552 then
+    begin
+      a:=a mod 65521;
+      b:=b mod 65521;
+      t:=0;
+    end;
+  end;
+  if t>0 then
+  begin
+    a:=a mod 65521;
+    b:=b mod 65521;
+  end;
+end;
+
+{==============================================================================}
+{ TBobError }
+{==============================================================================}
+
+constructor TBobError.Create;
+begin
+  Clear;
+end;
+
+procedure TBobError.Clear;
+var
+  i: Byte;
+begin
+  for i := 0 to C_MaxErrNum - 1 do
+  begin
+    Errs[i].ClassName := '';
+    Errs[i].MSG := '';
+  end;
+
+  ErrCount := 0;
+end;
+
+procedure TBobError.Add(AClassName: ShortString; const Msg: ShortString);
+begin
+  if ErrCount < C_MaxErrNum then
+  begin
+    Errs[ErrCount].ClassName := AClassName;
+    Errs[ErrCount].MSG := Msg;
+    Inc(ErrCount);
+  end;
+  // 否则忽略，不覆盖已存在的错误
+end;
+
+function TBobError.GetErr(Idx: Byte): TRErr;
+begin
+  if Idx < ErrCount then
+    Result := Errs[Idx]
+  else
+  begin
+    Result.ClassName := '';
+    Result.MSG := '';
+  end;
+end;
+
+{==============================================================================}
+{ TBobBufRef }
+{==============================================================================}
+constructor TBobBufRef.Create;
+begin
+  FBufPtr:=nil;
+  FCap:=0;
+  FStat:=0;
+  Len:=0;
+  Pos:=0;
+  RecL:=1;
+end;
+
+procedure TBobBufRef.Assign(ABuf:PByte; ASize:UInt32); //挂载Reccord
+begin
+  FBufPtr:=ABuf;
+  FCap:=ASize;
+  Pos:=0;
+  Len:=0;
+end;
+
+{==============================================================================}
+{ TBobIOSeek }
+{==============================================================================}
+constructor TBobIOSeek.Create(ABuf:TBobBufRef);
+begin
+  FData:=Abuf;
+  FBitIdx:=0;
+  LoadOrSave:=nil;
+  SetBitMask(False);
+  FErr:=TBobError.Create;
+  FOwnErr:=True;
+end;
+
+destructor TBobIOSeek.Destroy;
+begin
+  if FOwnErr then FErr.Free;
+  inherited Destroy;
+end;
+
+procedure TBobIOSeek.SetErr(AErr:TBobError); //设置本类ERR
+begin
+  if Assigned(AErr) then
+  begin
+    if FOwnErr then FErr.Free;
+    FErr:=AErr;
+    FOwnErr:=False;
+  end;
+end;
+
+procedure TBobIOSeek.SetBitMask(aBitM:Boolean);
+begin
+  FisLSB:=aBitM;
+  if FisLSB then FBitMask:=@C_BitLSB[0]
+  else FBitMask:=@C_BitMSB[0];
+end;
+// 移动方法
+function TBobIOSeek.Skip(Aoff:Int32):Boolean;  //安全跳转
+var
+  Pos:Int64;
+  EC:Byte;
+begin
+  EC:=FErr.Count;
+  Pos:=FData.Pos+Aoff;
+  if Pos < 0 then FErr.Add(Self.ClassName,'Skip less 0');
+  if Uint64(Pos) > FData.Cap then FErr.Add(Self.ClassName,'Skip over Cap');
+  Result:=(FErr.Count=EC);
+  if Result then FData.Pos:=Pos;
+end;
+procedure TBobIOSeek.Top;   //缓存头
+begin
+ FData.Pos:=0;
+end;
+
+procedure TBobIOSeek.Bott;  //有效数据
+begin
+  FData.Pos:=FData.Len;
+end;
+
+procedure TBobIOSeek.RegLoadOrSaveEV(EV:TBobBufEV);
+begin
+  if Assigned(EV) then LoadOrSave:=EV;
+end;
+
+{==============================================================================}
+{ TBobIOLoad }
+{==============================================================================}
+constructor TBobIOLoad.Create(ABuf:TBobBufRef);
+begin
+  inherited Create(ABuf);
+end;
+
+function TBobIOLoad.EnsureBytes(Ahead: Integer): Boolean; //预定本块内可操作字节，允许负值，不跨块
+begin
+  Result:=((FData.Pos+Ahead)>=0) and ((FData.Pos+Ahead)<=FData.Len);
+end;
+
+procedure TBobIOLoad.FastPopBit(out B:Byte);  //位流
+begin
+  B:=Ord((FData.FBufPtr[FData.Pos] and FBitMask[FBitIdx]) <> 0);
+  Inc(FBitIdx);
+  if FBitIdx <8 then Exit;
+  Inc(FData.Pos);
+  FBitIdx:=0;
+end;
+
+procedure TBobIOLoad.FastPopByte(out B:Byte);  //字节流
+begin
+  B:=FData.FBufPtr[FData.Pos];
+  Inc(FData.Pos);
+end;
+
+procedure TBobIOLoad.FastPopVarRec(out Abuf:PByte);   //块流, 返回指针引用，Pos增长RecL
+begin
+  Abuf:=@FData.FBufPtr[FData.Pos];
+  Inc(FData.Pos,FData.RecL);
+end;
+
+function TBobIOLoad.PopBit(out B:Byte):Boolean;  //位流
+begin
+  if FData.Pos>=FData.Len then                   // 启动事件钩子
+  begin
+    if not Assigned(LoadOrSave) then Exit(False);
+    Result:=LoadOrSave(FData);
+    if not Result then Exit;
+    FData.Pos:=0; //清空字节指针
+    FBitIdx:=0;   //清空位指针
+  end;
+  FastPopBit(B);
+  Result:=True;
+end;
+
+function TBobIOLoad.PopByte(out B:Byte):Boolean;  //字节流
+begin
+  if FData.Pos>=FData.Len then                   // 启动事件钩子
+  begin
+    if not Assigned(LoadOrSave) then Exit(False);
+    Result:=LoadOrSave(FData);
+    if not Result then Exit;
+    FData.Pos:=0; //清空字节指针
+    FBitIdx:=0;   //清空位指针
+  end;
+  FastPopByte(B);
+  Result:=True;
+end;
+
+function TBobIOLoad.PopBuf(Abuf:PByte; ALen:UInt32):Boolean;   //块流, Move后返回
+//读出数据，返回是否成功，空间不够不读，假设流永远OK
+begin
+  Result:=False;
+  if (FData.Pos+ALen)>FData.Len then
+    FErr.Add(Self.ClassName,Format('At Pos %d Pop %d > Len %d.',[FData.Pos,ALen,FData.Len]))
+  else
+  begin
+    Move(FData.FBufPtr[FData.Pos],Abuf[0],ALen);
+    Inc(FData.Pos, ALen); //更新当前数据指针
+    Result:=True;
+  end;
+end;
+
+{==============================================================================}
+{ TBobIOSave }
+{==============================================================================}
+constructor TBobIOSave.Create(ABuf:TBobBufRef);
+begin
+  inherited Create(ABuf);
+end;
+
+function TBobIOSave.EnsureBytes(Ahead: Integer): Boolean; //预定本块内可操作字节，允许负值，不跨块
+begin
+  Result:=((FData.Pos+Ahead)>=0) and ((FData.Pos+Ahead)<FData.Cap);
+end;
+
+procedure TBobIOSave.ClearData; // 清空数据（写模式需要）
+begin
+  FillByte(FData.FBufPtr[0],FData.Cap,0);
+  FData.Pos:=0;
+  FData.Len:=0;
+end;
+
+procedure TBobIOSave.Flush(isReset: Boolean);  //清空缓存
+begin
+  if FBitIdx>0 then
+  begin
+    Inc(FData.Pos); //刷入位
+    FBitIdx:=0;
+  end;
+  FData.Len:=FData.Pos;
+  if Assigned(LoadOrSave) and (FData.Len>0) then
+    if LoadOrSave(FData) then
+      if isReset then
+        begin
+          FData.Pos:=0;
+          FData.Len:=0;
+          FBitIdx:=0;
+        end;
+end;
+
+// 快速操作函数，函数体内不做边界检查
+procedure TBobIOSave.FastPushBit(B:Byte); //位流
+begin
+  if B>0 then FData.FBufPtr[FData.Pos]:= FData.FBufPtr[FData.Pos] or FBitMask[FBitIdx];
+  Inc(FBitIdx);
+  if FBitIdx <8 then Exit;
+  Inc(FData.Pos);
+  FBitIdx:=0;
+end;
+
+procedure TBobIOSave.FastPushByte(B:Byte); //字节流
+begin
+  FData.FBufPtr[FData.Pos]:=B;
+  Inc(FData.Pos);
+end;
+
+
+// 安全操作函数，确保不越界
+function TBobIOSave.PushBit(B:Byte):Boolean;  //位流
+begin
+  if FData.Pos>=FData.Cap then                   // 启动事件钩子
+  begin
+    if not Assigned(LoadOrSave) then Exit(False);
+    if FData.Pos > FData.Len then FData.Len := FData.Pos;  // 更新有效数据
+    Result:=LoadOrSave(FData);
+    if not Result then Exit;
+    FData.Len:=0; //有效数据清空
+    FData.Pos:=0; //清空字节指针
+    FBitIdx:=0;   //清空位指针
+  end;
+  FastPushBit(B);
+  Result:=True;
+end;
+
+function TBobIOSave.PushByte(B:Byte):Boolean; //字节流
+begin
+  if FData.Pos>=FData.Cap then                   // 启动事件钩子
+  begin
+    if not Assigned(LoadOrSave) then Exit(False);
+    if FData.Pos > FData.Len then FData.Len := FData.Pos;  // 更新有效数据
+    Result:=LoadOrSave(FData);
+    if not Result then Exit;
+    FData.Len:=0; //有效数据清空
+    FData.Pos:=0; //清空字节指针
+    FBitIdx:=0;   //清空位指针
+  end;
+  FastPushByte(B);
+  Result:=True;
+end;
+
+function TBobIOSave.PushBuf(Abuf:PByte; ALen:UInt32):Boolean;   //块流, Move后返回
+//写入数据，返回是否成功，空间不够不写  假设流永远OK
+begin
+  Result:=False;
+  if (FData.Pos+ALen)>FData.FCap then
+    FErr.Add(Self.ClassName,Format('At Pos %d Push %d > Cap %d.',[FData.Pos,ALen,FData.FCap]))
+  else
+  begin
+    Move(Abuf[0],FData.FBufPtr[FData.Pos],ALen);
+    Inc(FData.Pos, ALen); //更新当前数据指针
+    FData.Len := Max(FData.Len, FData.Pos);
+    Result:=True;
+  end;
+end;
+
+{==============================================================================}
+{ TBobBaseBuf }
+{==============================================================================}
+constructor TBobBaseBuf.Create;
+begin
+  //1. 初始化基础类
+  FSS:=nil;
+  FBuf:=TMemoryStream.Create; //初始化缓存流
+  FBuf.SetSize(0);
+  FData:=TBobBufRef.Create;  //初始化缓存引用
+  FLoader:=TBobIOLoad.Create(FData);  //初始化内部操作接口
+  FSaver:=TBobIOSave.Create(FData);
+  //2. 注册读取/写入事件
+  FLoader.RegLoadOrSaveEV(TBobBufEV(@FromStream));
+  FSaver.RegLoadOrSaveEV(TBobBufEV(@ToStream));
+
+  //2.初始化内部参数
+  FEVMask:=0; //无事件
+  FErr:=TBobError.Create;
+  FOwnErr:=True;
+  FLoader.SetErr(FErr);
+  FSaver.SetErr(FErr);
+end;
+
+constructor TBobBaseBuf.Create(const ASize:UInt32);  // 初始化指定大小的自有缓存
+begin
+  Create;
+  SetSize(ASize);
+end;
+
+constructor TBobBaseBuf.Create(const Buf:PByte; const Cap:UInt32; const RecLen:UInt16); //根据引用创建缓存
+begin
+  Create;
+  AssignRec(Buf,Cap,RecLen);
+end;
+
+destructor TBobBaseBuf.Destroy;
+begin
+  FLoader.Free;
+  FSaver.Free;
+  FBuf.Free;
+  FData.Free;
+  if FOwnErr then FErr.Free;
+  inherited Destroy;
+end;
+
+procedure TBobBaseBuf.SetErr(AErr:TBobError); //设置本类ERR
+begin
+  if Assigned(AErr) then
+  begin
+    if FOwnErr then FErr.Free;
+    FErr:=AErr;
+    FLoader.SetErr(FErr);
+    FSaver.SetErr(FErr);
+    FOwnErr:=False;
+  end;
+end;
+
+procedure TBobBaseBuf.SetSize(BufSize:UInt32); //设置Buf位内部模式，并重置大小，0为清空缓存
+begin
+  if (BufSize=0) or (BufSize>(UInt32(1) shl 30)) then exit; //缓存大小越界
+  if FBuf.Size < BufSize then  //按需重新申请缓存
+  begin
+    FBuf.SetSize(BufSize); //申请缓存;
+    FillByte(FBuf.Memory^,BufSize,0); //固化物理内存
+  end;
+  FData.Assign(PByte(FBuf.Memory),FBuf.Size); //引用挂载资源指针
+
+  FData.FStat:=0; //初始化状态
+  FData.FStat.Bits[C_BobStreamConst.BufStatus.isRec]:=False; // 设为Buf模式
+  FData.FStat.Bits[C_BobStreamConst.BufStatus.isAll]:=False; // 设为非整存整取模式
+  FData.FStat.Bits[C_BobStreamConst.BufStatus.isUsed]:=True; // 启用
+end;
+
+procedure TBobBaseBuf.AssignRec(const Buf:PByte; const Cap:UInt32; const RecLen:UInt16); //挂载外部记录
+begin
+  if (Cap=0) or (Cap>(UInt32(1) shl 30)) then exit; //缓存大小越界
+  FBuf.SetSize(0);  //释放自有缓存
+  FData.Assign(Buf,Cap); //挂载外部资源
+  FData.RecL:=RecLen; // 设置记录
+
+  FData.FStat:=0; //初始化状态
+  FData.FStat.Bits[C_BobStreamConst.BufStatus.isRec]:=True; // 设为Rec模式
+  FData.FStat.Bits[C_BobStreamConst.BufStatus.isAll]:=(Cap=RecLen); // 设置整存整取模式
+  FData.FStat.Bits[C_BobStreamConst.BufStatus.isUsed]:=True; // 0为禁用
+end;
+
+procedure TBobBaseBuf.AssignBuf(const BufRef:TBobBufRef); //挂载外部缓存
+begin
+  FBuf.SetSize(0); //释放自有资源
+  FData.Assign(BufRef.Ptr, BufRef.Cap); //挂载引用
+  FData.RecL:=BufRef.RecL;
+  FData.FStat:=BufRef.FStat;
+
+  FData.FStat.Bits[C_BobStreamConst.BufStatus.isUsed]:=True; // 启用
+end;
+
+function TBobBaseBuf.CountCRC:UInt32;
+var
+  Adler: TRCRC_Adler32;
+begin
+  Adler.Init;
+  Adler.Update(FData.FBufPtr,FData.Len);
+  Result:=Adler.CRC32;
+end;
+
+function TBobBaseBuf.DoEvent(When:Byte):Boolean;
+begin
+  Result:=True;
+  if FEVMask.Bits[When] then
+    Result:=FEvents[When](FData); // 执行事件;
+  if not Result then FErr.Add(Self.ClassName,Format('When %d Event Do Error.',[When]));
+end;
+
+procedure TBobBaseBuf.RegEvent(AWhen:Byte; AEV:TBobBufEV);
+begin
+  if AWhen > 7 then Exit;
+  FEVMask.Bits[AWhen]:=True;
+  FEvents[AWhen]:=AEV;
+end;
+
+procedure TBobBaseBuf.ClearEvent;
+begin
+  FEVMask:=0;
+end;
+
+function TBobBaseBuf.ToStream(const BufRef: TBobBufRef): Boolean; //把缓存数据，全部写入上游流
+var
+  Len,WLen:UInt32;
+  ErrC:Byte;
+begin
+  ErrC:=FErr.Count; Result:=False;
+  if not FData.FStat.Bits[C_BobStreamConst.BufStatus.isUsed] then
+    FErr.Add(Self.ClassName,'Buf unUsed, can not ToStream');
+  if not Assigned(FSS) then FErr.Add(Self.ClassName,'BaseStream not Assigned');
+  if FErr.Count<>ErrC then Exit;
+
+  //处理事件并写入流
+  DoEvent(C_BobStreamConst.Event.BeSave);
+  if  FData.FStat.Bits[C_BobStreamConst.BufStatus.isAll]   //记录模式
+    then Len:=FData.Cap
+    else Len:=FData.Len;
+  WLen:=FSS.Write(FData.Ptr[0],Len);  // 写入外部数据
+  if WLen<>Len then FErr.Add(Self.ClassName,Format('Stream Save Data Error [%d/%d].',[Len,WLen]));
+  Result:=(FErr.Count=ErrC);
+  if Result then
+  begin
+    DoEvent(C_BobStreamConst.Event.AfSave);
+    Saver.ClearData;  //清空缓存
+    Fdata.Len:=0;
+    FData.Pos:=0;
+  end;
+end;
+
+function TBobBaseBuf.Flush: Boolean;
+var
+  EC:Byte;
+begin
+  EC:=FErr.Count;
+  FSaver.Flush;
+  Result := (EC=FErr.Count);
+end;
+
+function TBobBaseBuf.FromStream(const BufRef: TBobBufRef): Boolean;
+var
+  EC:Byte;
+begin
+  EC:=FErr.Count; Result:=False;
+  if not FData.FStat.Bits[C_BobStreamConst.BufStatus.isUsed] then
+    FErr.Add(Self.ClassName,'Buf not enable, can not FromStream');
+  if not Assigned(FSS) then FErr.Add(Self.ClassName,'BaseStream not Assigned');
+  if EC<>FErr.Count then Exit;
+
+  //处理事件并读取
+  DoEvent(C_BobStreamConst.Event.BeRead);
+  FData.Len:=FSS.Read(FData.Ptr[0],FData.FCap); //尝试读取缓存大小数据
+
+  if FData.FStat.Bits[C_BobStreamConst.BufStatus.isAll]  //整存整取模式
+     then if (FData.Len <> FData.Cap) and (FSS.Position < FSS.Size)
+        then FErr.Add(Self.ClassName,Format('Stream Load exRec Error [%d/%d].',[FData.Cap,FData.Len]));
+  Result:=(EC=FErr.Count) and (FData.Len>0);
+  if Result then
+  begin
+    DoEvent(C_BobStreamConst.Event.AfRead);
+    FData.Pos:=0; //设置当前操作指针
+  end
+end;
+
+{==============================================================================}
+{ TBobBufBus }
+{==============================================================================}
+constructor TBobBufBus.Create;
+var
+  i:Integer;
+begin
+  FErr:=TBobError.Create;
+  FOwnErr:=True;
+  // 缺省全部enable, 置空
+  for i:=0 to High(FBufArr) do
+  begin
+    FBufArr[i]:= TBobBaseBuf.Create;
+    FBufArr[i].SetErr(FErr);
+    if i<C_SlotNum then
+    begin
+      Slots[i]:=TSlot.Create;
+      Slots[i].BaseStream:=nil;
+      Slots[i].Mask:=0;
+    end;
+  end;
+  EnableBufs(0);
+end;
+
+destructor TBobBufBus.Destroy;
+var
+  i:Integer;
+begin
+  if FOwnErr then FErr.Free;
+  for i:=0 to 7 do
+  begin
+    if i<C_SlotNum then Slots[i].Free;
+    if Assigned(FBufArr[i]) then FBufArr[i].Free;
+  end;
+  inherited Destroy;
+end;
+
+procedure TBobBufBus.SetErr(AErr:TBobError);
+var
+  i:Byte;
+begin
+  if not Assigned(AErr) then Exit;
+  if FOwnErr then FErr.Free;
+  FErr:=AErr;
+  FOwnErr:=False;
+  //聚合出错信息
+  for i:=0 to High(FBufArr) do
+    FBufArr[i].SetErr(FErr);
+end;
+
+procedure TBobBufBus.EnableBufs(ABufMask:Byte); //启，停用缓存
+var
+  i:Integer;
+begin
+  FBufMask:=ABufMask;
+  for i:=0 to 7 do
+    FBufArr[i].FData.FStat.Bits[C_BobStreamConst.BufStatus.isUsed]:=ABufMask.Bits[i];
+end;
+
+function TBobBufBus.Exec(ABufs:Byte; AComd:Byte=0):Boolean; //操作
+var
+  i:Integer;
+begin
+  Result:=False;
+  for i:=0 to 7 do
+    if ABufs.Bits[i] and FBufMask.Bits[i] then // 检查缓冲区是否被请求且已配置
+    begin
+      case AComd of
+        CMD_Load : Result:=FBufArr[i].FromStream(FBufArr[i].FData);
+        CMD_Save : Result:=FBufArr[i].ToStream(FBufArr[i].FData);
+        CMD_Flush: Result:=FBufArr[i].Flush;
+      else
+        begin
+          FErr.Add(Self.ClassName,'unknown CMD');
+          Exit;
+        end;
+      end;
+      if not Result then Exit;
+    end;
+end;
+
+procedure TBobBufBus.ReNewEvents;  //清空并重置标准事件
+var
+  i:UInt8;
+begin
+  for i:=0 to 7 do
+    if FBufMask.Bits[i] then FBufArr[i].ClearEvent;
+end;
+
+procedure TBobBufBus.Slots2Bufs;
+var
+  i,j:Byte;
+begin
+  FBufMask:=0;
+  for i:=0 to High(FBufArr) do
+  begin
+    FBufArr[i].BaseStream:=nil;
+    FBufArr[i].FData.FStat.Bits[C_BobStreamConst.BufStatus.isUsed]:=False;
+  end;
+
+  for i:=0 to High(Slots) do
+    if Slots[i].Mask>0 then
+      begin
+        FBufMask:=FBufMask or Slots[i].Mask;
+        for j:=0 to C_BufNum-1 do
+        begin
+          if Slots[i].Mask.Bits[j] then
+          begin
+            FBufArr[j].FSS:=Slots[i].BaseStream;
+            FBufArr[j].FData.FStat.Bits[C_BobStreamConst.BufStatus.isUsed]:=True;
+          end;
+        end;
+      end;
+end;
+
+{==============================================================================}
+{ TBobBufsWorkerLib }
+{==============================================================================}
+constructor TBobBufsWorkerLib.Create;
+begin
+  inherited Create;
+  // 启用0,1;Slot,
+  Slots[IDX_B0].Mask:=(&1 shl IDX_B0);
+  Slots[IDX_B1].Mask:=(&1 shl IDX_B1);
+  // 设置缓存大小
+  FBufArr[IDX_B0].SetSize(UInt32(1) shl C_BufBitsBig);
+  FBufArr[IDX_B1].SetSize(UInt32(1) shl C_BufBitsBig);
+end;
+
+destructor TBobBufsWorkerLib.Destroy;
+begin
+  inherited Destroy;
+end;
+
+procedure TBobBufsWorkerLib.BlockCopyer(F1,F2:TStream);   //复制器
+begin
+  Slots[IDX_B0].BaseStream:=F1;
+  Slots[IDX_B1].BaseStream:=F2;
+  Slots2Bufs;
+
+  //联立
+  FBufArr[IDX_B1].AssignBuf(FBufArr[IDX_B0].Ref);
+  F1.Seek(0,soBeginning);
+
+  while F1.Position < F1.Size do
+  begin
+    FBufArr[IDX_B0].FromStream;
+    FBufArr[IDX_B1].Ref.Len:=FBufArr[IDX_B0].Ref.Len;
+    FBufArr[IDX_B1].ToStream;
+  end;
+end;
+
+procedure TBobBufsWorkerLib.Checker(F1,F2:TStream);  //检查器
+var
+  i: Integer;
+begin
+  Slots[IDX_B0].BaseStream:=F1;
+  Slots[IDX_B1].BaseStream:=F2;
+  Slots2Bufs;
+
+  FErr.Clear;
+  if F1.Size <> F2.Size then   // 检查大小
+    FErr.Add(Self.ClassName,Format('File Len Err: %d <> %d',[F1.Size,F2.Size]));
+  F1.Seek(0,soBeginning);
+  F2.Seek(0,soBeginning);
+  while (F1.Position < F1.Size) and (FErr.Count=0) do
+  begin
+    FBufArr[IDX_B0].FromStream;
+    FBufArr[IDX_B1].FromStream;
+    if FBufArr[IDX_B0].Ref.Len<>FBufArr[IDX_B1].Ref.Len then //缓存块长度
+      FErr.Add(Self.ClassName,Format('Block Read Len Err: %d <> %d',[FBufArr[IDX_B0].Ref.Len,FBufArr[IDX_B1].Ref.Len]));
+    if FBufArr[IDX_B0].Ref.Len=0 then Continue;
+    if not CompareMem(FBufArr[IDX_B0].Ref.Ptr, FBufArr[IDX_B1].Ref.Ptr, Len) then
+      FErr.Add(Self.ClassName,'Block Byte Compare Err');
+ //   for i:=0 to FBufArr[IDX_B0].Ref.Len-1 do
+ //     if FBufArr[IDX_B0].Ref.Ptr[i]<>FBufArr[IDX_B1].Ref.Ptr[i] then
+ //       FErr.Add(Self.ClassName,Format('Block Byte Err: %d <> %d',[FBufArr[IDX_B0].Ref.Ptr[i],FBufArr[IDX_B1].Ref.Ptr[i]]));
+  end;
+end;
+
+
+end.
